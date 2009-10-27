@@ -181,18 +181,8 @@ config LIBIPW_DEBUG
 	  This option will enable debug tracing output for the
 	  libipw component.
 
-	  This will result in the kernel module being ~70k larger.  You
-	  can control which debug output is sent to the kernel log by
-	  setting the value in
-
-	  /proc/net/ieee80211/debug_level
-
-	  For example:
-
-	  % echo 0x00000FFO > /proc/net/ieee80211/debug_level
-
-	  For a list of values you can assign to debug_level, you
-	  can look at the bit mask values in ieee80211.h
+	  This will result in the kernel module being ~70k larger. You
+          can load the module with the 'debug=N' option
 
 	  If you are not trying to debug or develop the libipw
 	  component, you most likely want to say N here.
