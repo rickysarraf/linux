@@ -2302,6 +2302,7 @@ struct page *ext4_encrypt(struct inode *inode,
 int ext4_decrypt(struct page *page);
 int ext4_encrypted_zeroout(struct inode *inode, ext4_lblk_t lblk,
 			   ext4_fsblk_t pblk, ext4_lblk_t len);
+extern const struct dentry_operations ext4_encrypted_d_ops;
 
 #ifdef CONFIG_EXT4_FS_ENCRYPTION
 int ext4_init_crypto(void);
@@ -2896,7 +2897,7 @@ do {								\
 static inline void ext4_update_i_disksize(struct inode *inode, loff_t newsize)
 {
 	WARN_ON_ONCE(S_ISREG(inode->i_mode) &&
-		     !mutex_is_locked(&inode->i_mutex));
+		     !inode_is_locked(inode));
 	down_write(&EXT4_I(inode)->i_data_sem);
 	if (newsize > EXT4_I(inode)->i_disksize)
 		EXT4_I(inode)->i_disksize = newsize;

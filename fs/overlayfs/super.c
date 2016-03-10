@@ -76,12 +76,14 @@ enum ovl_path_type ovl_path_type(struct dentry *dentry)
 	if (oe->__upperdentry) {
 		type = __OVL_PATH_UPPER;
 
-		if (oe->numlower) {
-			if (S_ISDIR(dentry->d_inode->i_mode))
-				type |= __OVL_PATH_MERGE;
-		} else if (!oe->opaque) {
+		/*
+		 * Non-dir dentry can hold lower dentry from previous
+		 * location. Its purity depends only on opaque flag.
+		 */
+		if (oe->numlower && S_ISDIR(dentry->d_inode->i_mode))
+			type |= __OVL_PATH_MERGE;
+		else if (!oe->opaque)
 			type |= __OVL_PATH_PURE;
-		}
 	} else {
 		if (oe->numlower > 1)
 			type |= __OVL_PATH_MERGE;
@@ -229,7 +231,7 @@ void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry)
 {
 	struct ovl_entry *oe = dentry->d_fsdata;
 
-	WARN_ON(!mutex_is_locked(&upperdentry->d_parent->d_inode->i_mutex));
+	WARN_ON(!inode_is_locked(upperdentry->d_parent->d_inode));
 	WARN_ON(oe->__upperdentry);
 	BUG_ON(!upperdentry->d_inode);
 	/*
@@ -244,7 +246,7 @@ void ovl_dentry_version_inc(struct dentry *dentry)
 {
 	struct ovl_entry *oe = dentry->d_fsdata;
 
-	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+	WARN_ON(!inode_is_locked(dentry->d_inode));
 	oe->version++;
 }
 
@@ -252,7 +254,7 @@ u64 ovl_dentry_version_get(struct dentry *dentry)
 {
 	struct ovl_entry *oe = dentry->d_fsdata;
 
-	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+	WARN_ON(!inode_is_locked(dentry->d_inode));
 	return oe->version;
 }
 
@@ -341,6 +343,7 @@ static const struct dentry_operations ovl_dentry_operations = {
 
 static const struct dentry_operations ovl_reval_dentry_operations = {
 	.d_release = ovl_dentry_release,
+	.d_select_inode = ovl_d_select_inode,
 	.d_revalidate = ovl_dentry_revalidate,
 	.d_weak_revalidate = ovl_dentry_weak_revalidate,
 };
@@ -375,9 +378,9 @@ static inline struct dentry *ovl_lookup_real(struct dentry *dir,
 {
 	struct dentry *dentry;
 
-	mutex_lock(&dir->d_inode->i_mutex);
+	inode_lock(dir->d_inode);
 	dentry = lookup_one_len(name->name, dir, name->len);
-	mutex_unlock(&dir->d_inode->i_mutex);
+	inode_unlock(dir->d_inode);
 
 	if (IS_ERR(dentry)) {
 		if (PTR_ERR(dentry) == -ENOENT)
@@ -744,7 +747,7 @@ static struct dentry *ovl_workdir_create(struct vfsmount *mnt,
 	if (err)
 		return ERR_PTR(err);
 
-	mutex_lock_nested(&dir->i_mutex, I_MUTEX_PARENT);
+	inode_lock_nested(dir, I_MUTEX_PARENT);
 retry:
 	work = lookup_one_len(OVL_WORKDIR_NAME, dentry,
 			      strlen(OVL_WORKDIR_NAME));
@@ -770,7 +773,7 @@ retry:
 			goto out_dput;
 	}
 out_unlock:
-	mutex_unlock(&dir->i_mutex);
+	inode_unlock(dir);
 	mnt_drop_write(mnt);
 
 	return work;
