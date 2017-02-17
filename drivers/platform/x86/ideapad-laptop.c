@@ -443,7 +443,7 @@ static ssize_t touchpad_store(struct device *dev,
 	struct ideapad_private *priv = dev_get_drvdata(dev);
 	int ret, state;
 
-	ret = kstrtoint(buf, 0, &state);
+	ret = kstrtobool(buf, &state);
 	if (ret)
 		return ret;
 
