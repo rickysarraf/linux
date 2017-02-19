@@ -441,14 +441,12 @@ static ssize_t touchpad_store(struct device *dev,
 				 const char *buf, size_t count)
 {
 	struct ideapad_private *priv = dev_get_drvdata(dev);
-	int ret, state;
+	int ret;
+        bool state;
 
 	ret = kstrtobool(buf, &state);
 	if (ret)
 		return ret;
-
-	if (state != 0 && state != 1)
-		return -EINVAL;
 
 	ret = write_ec_cmd(priv->adev->handle, VPCCMD_W_TOUCHPAD, state);
 	if (ret < 0)
