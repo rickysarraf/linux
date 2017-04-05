@@ -217,6 +217,14 @@ int hid_sensor_write_samp_freq_value(struct hid_sensor_common *st,
 	if (ret < 0 || value < 0)
 		ret = -EINVAL;
 
+	ret = sensor_hub_get_feature(st->hsdev,
+				     st->poll.report_id,
+				     st->poll.index, sizeof(value), &value);
+	if (ret < 0 || value < 0)
+		return -EINVAL;
+
+	st->poll_interval = value;
+
 	return ret;
 }
 EXPORT_SYMBOL(hid_sensor_write_samp_freq_value);
@@ -261,6 +269,15 @@ int hid_sensor_write_raw_hyst_value(struct hid_sensor_common *st,
 				     &value);
 	if (ret < 0 || value < 0)
 		ret = -EINVAL;
+
+	ret = sensor_hub_get_feature(st->hsdev,
+				     st->sensitivity.report_id,
+				     st->sensitivity.index, sizeof(value),
+				     &value);
+	if (ret < 0 || value < 0)
+		return -EINVAL;
+
+	st->raw_hystersis = value;
 
 	return ret;
 }
