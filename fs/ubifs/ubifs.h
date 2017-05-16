@@ -1758,6 +1758,7 @@ int ubifs_xattr_set(struct inode *host, const char *name, const void *value,
 		    size_t size, int flags);
 ssize_t ubifs_xattr_get(struct inode *host, const char *name, void *buf,
 			size_t size);
+void ubifs_evict_xattr_inode(struct ubifs_info *c, ino_t xattr_inum);
 
 /* super.c */
 struct inode *ubifs_iget(struct super_block *sb, unsigned long inum);
