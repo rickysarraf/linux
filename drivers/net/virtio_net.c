@@ -1818,6 +1818,7 @@ static const struct net_device_ops virtnet_netdev = {
 	.ndo_busy_poll		= virtnet_busy_poll,
 #endif
 	.ndo_xdp		= virtnet_xdp,
+	.ndo_features_check	= passthru_features_check,
 };
 
 static void virtnet_config_changed_work(struct work_struct *work)
