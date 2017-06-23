@@ -172,6 +172,7 @@ static int filelayout_async_handle_error(struct rpc_task *task,
 	case -NFS4ERR_RETRY_UNCACHED_REP:
 		break;
 	/* Invalidate Layout errors */
+	case -NFS4ERR_ACCESS:
 	case -NFS4ERR_PNFS_NO_LAYOUT:
 	case -ESTALE:           /* mapped NFS4ERR_STALE */
 	case -EBADHANDLE:       /* mapped NFS4ERR_BADHANDLE */
