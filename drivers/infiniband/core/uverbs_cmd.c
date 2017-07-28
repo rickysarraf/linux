@@ -2345,8 +2345,7 @@ static int modify_qp(struct ib_uverbs_file *file,
 		goto out;
 	}
 
-	if ((cmd->base.attr_mask & IB_QP_PORT) &&
-	    !rdma_is_port_valid(qp->device, cmd->base.port_num)) {
+	if (!rdma_is_port_valid(qp->device, cmd->base.port_num)) {
 		ret = -EINVAL;
 		goto release_qp;
 	}
