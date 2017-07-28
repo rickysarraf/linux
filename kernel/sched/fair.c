@@ -1385,7 +1385,6 @@ static unsigned long weighted_cpuload(const int cpu);
 static unsigned long source_load(int cpu, int type);
 static unsigned long target_load(int cpu, int type);
 static unsigned long capacity_of(int cpu);
-static long effective_load(struct task_group *tg, int cpu, long wl, long wg);
 
 /* Cached statistics for all CPUs within a node */
 struct numa_stats {
@@ -2473,7 +2472,8 @@ void task_numa_work(struct callback_head *work)
 		return;
 
 
-	down_read(&mm->mmap_sem);
+	if (!down_read_trylock(&mm->mmap_sem))
+		return;
 	vma = find_vma(mm, start);
 	if (!vma) {
 		reset_ptenuma_scan(p);
@@ -2588,6 +2588,60 @@ void task_tick_numa(struct rq *rq, struct task_struct *curr)
 		}
 	}
 }
+
+/*
+ * Can a task be moved from prev_cpu to this_cpu without causing a load
+ * imbalance that would trigger the load balancer?
+ */
+static inline bool numa_wake_affine(struct sched_domain *sd,
+				    struct task_struct *p, int this_cpu,
+				    int prev_cpu, int sync)
+{
+	struct numa_stats prev_load, this_load;
+	s64 this_eff_load, prev_eff_load;
+
+	update_numa_stats(&prev_load, cpu_to_node(prev_cpu));
+	update_numa_stats(&this_load, cpu_to_node(this_cpu));
+
+	/*
+	 * If sync wakeup then subtract the (maximum possible)
+	 * effect of the currently running task from the load
+	 * of the current CPU:
+	 */
+	if (sync) {
+		unsigned long current_load = task_h_load(current);
+
+		if (this_load.load > current_load)
+			this_load.load -= current_load;
+		else
+			this_load.load = 0;
+	}
+
+	/*
+	 * In low-load situations, where this_cpu's node is idle due to the
+	 * sync cause above having dropped this_load.load to 0, move the task.
+	 * Moving to an idle socket will not create a bad imbalance.
+	 *
+	 * Otherwise check if the nodes are near enough in load to allow this
+	 * task to be woken on this_cpu's node.
+	 */
+	if (this_load.load > 0) {
+		unsigned long task_load = task_h_load(p);
+
+		this_eff_load = 100;
+		this_eff_load *= prev_load.compute_capacity;
+
+		prev_eff_load = 100 + (sd->imbalance_pct - 100) / 2;
+		prev_eff_load *= this_load.compute_capacity;
+
+		this_eff_load *= this_load.load + task_load;
+		prev_eff_load *= prev_load.load - task_load;
+
+		return this_eff_load <= prev_eff_load;
+	}
+
+	return true;
+}
 #else
 static void task_tick_numa(struct rq *rq, struct task_struct *curr)
 {
@@ -2600,6 +2654,15 @@ static inline void account_numa_enqueue(struct rq *rq, struct task_struct *p)
 static inline void account_numa_dequeue(struct rq *rq, struct task_struct *p)
 {
 }
+
+#ifdef CONFIG_SMP
+static inline bool numa_wake_affine(struct sched_domain *sd,
+				    struct task_struct *p, int this_cpu,
+				    int prev_cpu, int sync)
+{
+	return true;
+}
+#endif /* !SMP */
 #endif /* CONFIG_NUMA_BALANCING */
 
 static void
@@ -2968,8 +3031,7 @@ __update_load_avg(u64 now, int cpu, struct sched_avg *sa,
  * differential update where we store the last value we propagated. This in
  * turn allows skipping updates if the differential is 'small'.
  *
- * Updating tg's load_avg is necessary before update_cfs_share() (which is
- * done) and effective_load() (which is not done because it is too costly).
+ * Updating tg's load_avg is necessary before update_cfs_share().
  */
 static inline void update_tg_load_avg(struct cfs_rq *cfs_rq, int force)
 {
@@ -5154,126 +5216,6 @@ static unsigned long cpu_avg_load_per_task(int cpu)
 	return 0;
 }
 
-#ifdef CONFIG_FAIR_GROUP_SCHED
-/*
- * effective_load() calculates the load change as seen from the root_task_group
- *
- * Adding load to a group doesn't make a group heavier, but can cause movement
- * of group shares between cpus. Assuming the shares were perfectly aligned one
- * can calculate the shift in shares.
- *
- * Calculate the effective load difference if @wl is added (subtracted) to @tg
- * on this @cpu and results in a total addition (subtraction) of @wg to the
- * total group weight.
- *
- * Given a runqueue weight distribution (rw_i) we can compute a shares
- * distribution (s_i) using:
- *
- *   s_i = rw_i / \Sum rw_j						(1)
- *
- * Suppose we have 4 CPUs and our @tg is a direct child of the root group and
- * has 7 equal weight tasks, distributed as below (rw_i), with the resulting
- * shares distribution (s_i):
- *
- *   rw_i = {   2,   4,   1,   0 }
- *   s_i  = { 2/7, 4/7, 1/7,   0 }
- *
- * As per wake_affine() we're interested in the load of two CPUs (the CPU the
- * task used to run on and the CPU the waker is running on), we need to
- * compute the effect of waking a task on either CPU and, in case of a sync
- * wakeup, compute the effect of the current task going to sleep.
- *
- * So for a change of @wl to the local @cpu with an overall group weight change
- * of @wl we can compute the new shares distribution (s'_i) using:
- *
- *   s'_i = (rw_i + @wl) / (@wg + \Sum rw_j)				(2)
- *
- * Suppose we're interested in CPUs 0 and 1, and want to compute the load
- * differences in waking a task to CPU 0. The additional task changes the
- * weight and shares distributions like:
- *
- *   rw'_i = {   3,   4,   1,   0 }
- *   s'_i  = { 3/8, 4/8, 1/8,   0 }
- *
- * We can then compute the difference in effective weight by using:
- *
- *   dw_i = S * (s'_i - s_i)						(3)
- *
- * Where 'S' is the group weight as seen by its parent.
- *
- * Therefore the effective change in loads on CPU 0 would be 5/56 (3/8 - 2/7)
- * times the weight of the group. The effect on CPU 1 would be -4/56 (4/8 -
- * 4/7) times the weight of the group.
- */
-static long effective_load(struct task_group *tg, int cpu, long wl, long wg)
-{
-	struct sched_entity *se = tg->se[cpu];
-
-	if (!tg->parent)	/* the trivial, non-cgroup case */
-		return wl;
-
-	for_each_sched_entity(se) {
-		struct cfs_rq *cfs_rq = se->my_q;
-		long W, w = cfs_rq_load_avg(cfs_rq);
-
-		tg = cfs_rq->tg;
-
-		/*
-		 * W = @wg + \Sum rw_j
-		 */
-		W = wg + atomic_long_read(&tg->load_avg);
-
-		/* Ensure \Sum rw_j >= rw_i */
-		W -= cfs_rq->tg_load_avg_contrib;
-		W += w;
-
-		/*
-		 * w = rw_i + @wl
-		 */
-		w += wl;
-
-		/*
-		 * wl = S * s'_i; see (2)
-		 */
-		if (W > 0 && w < W)
-			wl = (w * (long)scale_load_down(tg->shares)) / W;
-		else
-			wl = scale_load_down(tg->shares);
-
-		/*
-		 * Per the above, wl is the new se->load.weight value; since
-		 * those are clipped to [MIN_SHARES, ...) do so now. See
-		 * calc_cfs_shares().
-		 */
-		if (wl < MIN_SHARES)
-			wl = MIN_SHARES;
-
-		/*
-		 * wl = dw_i = S * (s'_i - s_i); see (3)
-		 */
-		wl -= se->avg.load_avg;
-
-		/*
-		 * Recursively apply this logic to all parent groups to compute
-		 * the final effective load change on the root group. Since
-		 * only the @tg group gets extra weight, all parent groups can
-		 * only redistribute existing shares. @wl is the shift in shares
-		 * resulting from this level per the above.
-		 */
-		wg = 0;
-	}
-
-	return wl;
-}
-#else
-
-static long effective_load(struct task_group *tg, int cpu, long wl, long wg)
-{
-	return wl;
-}
-
-#endif
-
 static void record_wakee(struct task_struct *p)
 {
 	/*
@@ -5324,67 +5266,25 @@ static int wake_wide(struct task_struct *p)
 static int wake_affine(struct sched_domain *sd, struct task_struct *p,
 		       int prev_cpu, int sync)
 {
-	s64 this_load, load;
-	s64 this_eff_load, prev_eff_load;
-	int idx, this_cpu;
-	struct task_group *tg;
-	unsigned long weight;
-	int balanced;
-
-	idx	  = sd->wake_idx;
-	this_cpu  = smp_processor_id();
-	load	  = source_load(prev_cpu, idx);
-	this_load = target_load(this_cpu, idx);
+	int this_cpu = smp_processor_id();
+	bool affine = false;
 
 	/*
-	 * If sync wakeup then subtract the (maximum possible)
-	 * effect of the currently running task from the load
-	 * of the current CPU:
+	 * Common case: CPUs are in the same socket, and select_idle_sibling()
+	 * will do its thing regardless of what we return:
 	 */
-	if (sync) {
-		tg = task_group(current);
-		weight = current->se.avg.load_avg;
-
-		this_load += effective_load(tg, this_cpu, -weight, -weight);
-		load += effective_load(tg, prev_cpu, 0, -weight);
-	}
-
-	tg = task_group(p);
-	weight = p->se.avg.load_avg;
-
-	/*
-	 * In low-load situations, where prev_cpu is idle and this_cpu is idle
-	 * due to the sync cause above having dropped this_load to 0, we'll
-	 * always have an imbalance, but there's really nothing you can do
-	 * about that, so that's good too.
-	 *
-	 * Otherwise check if either cpus are near enough in load to allow this
-	 * task to be woken on this_cpu.
-	 */
-	this_eff_load = 100;
-	this_eff_load *= capacity_of(prev_cpu);
-
-	prev_eff_load = 100 + (sd->imbalance_pct - 100) / 2;
-	prev_eff_load *= capacity_of(this_cpu);
-
-	if (this_load > 0) {
-		this_eff_load *= this_load +
-			effective_load(tg, this_cpu, weight, weight);
-
-		prev_eff_load *= load + effective_load(tg, prev_cpu, 0, weight);
-	}
-
-	balanced = this_eff_load <= prev_eff_load;
+	if (cpus_share_cache(prev_cpu, this_cpu))
+		affine = true;
+	else
+		affine = numa_wake_affine(sd, p, this_cpu, prev_cpu, sync);
 
 	schedstat_inc(p->se.statistics.nr_wakeups_affine_attempts);
+	if (affine) {
+		schedstat_inc(sd->ttwu_move_affine);
+		schedstat_inc(p->se.statistics.nr_wakeups_affine);
+	}
 
-	if (!balanced)
-		return 0;
-
-	schedstat_inc(sd->ttwu_move_affine);
-	schedstat_inc(p->se.statistics.nr_wakeups_affine);
-
-	return 1;
+	return affine;
 }
 
 static inline int task_util(struct task_struct *p);
@@ -5950,11 +5850,15 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 
 	if (affine_sd) {
 		sd = NULL; /* Prefer wake_affine over balance flags */
-		if (cpu != prev_cpu && wake_affine(affine_sd, p, prev_cpu, sync))
+		if (cpu == prev_cpu)
+			goto pick_cpu;
+
+		if (wake_affine(affine_sd, p, prev_cpu, sync))
 			new_cpu = cpu;
 	}
 
 	if (!sd) {
+ pick_cpu:
 		if (sd_flag & SD_BALANCE_WAKE) /* XXX always ? */
 			new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
 
@@ -6632,6 +6536,10 @@ static int migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
 	if (dst_nid == p->numa_preferred_nid)
 		return 0;
 
+	/* Leaving a core idle is often worse than degrading locality. */
+	if (env->idle != CPU_NOT_IDLE)
+		return -1;
+
 	if (numa_group) {
 		src_faults = group_faults(p, src_nid);
 		dst_faults = group_faults(p, dst_nid);
@@ -6683,10 +6591,10 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 		 * our sched_group. We may want to revisit it if we couldn't
 		 * meet load balance goals by pulling other tasks on src_cpu.
 		 *
-		 * Also avoid computing new_dst_cpu if we have already computed
-		 * one in current iteration.
+		 * Avoid computing new_dst_cpu for NEWLY_IDLE or if we have
+		 * already computed one in current iteration.
 		 */
-		if (!env->dst_grpmask || (env->flags & LBF_DST_PINNED))
+		if (env->idle == CPU_NEWLY_IDLE || (env->flags & LBF_DST_PINNED))
 			return 0;
 
 		/* Prevent to re-select dst_cpu via env's cpus */
@@ -8028,14 +7936,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
 		.tasks		= LIST_HEAD_INIT(env.tasks),
 	};
 
-	/*
-	 * For NEWLY_IDLE load_balancing, we don't need to consider
-	 * other cpus in our group
-	 */
-	if (idle == CPU_NEWLY_IDLE)
-		env.dst_grpmask = NULL;
-
-	cpumask_copy(cpus, cpu_active_mask);
+	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
 
 	schedstat_inc(sd->lb_count[idle]);
 
@@ -8156,7 +8057,15 @@ more_balance:
 		/* All tasks on this runqueue were pinned by CPU affinity */
 		if (unlikely(env.flags & LBF_ALL_PINNED)) {
 			cpumask_clear_cpu(cpu_of(busiest), cpus);
-			if (!cpumask_empty(cpus)) {
+			/*
+			 * Attempting to continue load balancing at the current
+			 * sched_domain level only makes sense if there are
+			 * active CPUs remaining as possible busiest CPUs to
+			 * pull load from which are not contained within the
+			 * destination group that is receiving any migrated
+			 * load.
+			 */
+			if (!cpumask_subset(cpus, env.dst_grpmask)) {
 				env.loop = 0;
 				env.loop_break = sched_nr_migrate_break;
 				goto redo;
@@ -8440,6 +8349,13 @@ static int active_load_balance_cpu_stop(void *data)
 			.src_cpu	= busiest_rq->cpu,
 			.src_rq		= busiest_rq,
 			.idle		= CPU_IDLE,
+			/*
+			 * can_migrate_task() doesn't need to compute new_dst_cpu
+			 * for active balancing. Since we have CPU_IDLE, but no
+			 * @dst_grpmask we need to make that test go away with lying
+			 * about DST_PINNED.
+			 */
+			.flags		= LBF_DST_PINNED,
 		};
 
 		schedstat_inc(sd->alb_count);
